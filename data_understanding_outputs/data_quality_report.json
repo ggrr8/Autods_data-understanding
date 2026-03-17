@@ -1,0 +1,67 @@
+{
+  "missing_values": {
+    "missing_count_by_column": {
+      "customer_id": 0,
+      "age": 1,
+      "income": 0,
+      "target": 0
+    },
+    "missing_ratio_by_column": {
+      "customer_id": 0.0,
+      "age": 0.2,
+      "income": 0.0,
+      "target": 0.0
+    }
+  },
+  "duplicate_rows": {
+    "count": 0,
+    "ratio": 0.0
+  },
+  "constant_columns": [],
+  "all_missing_columns": [],
+  "high_missing_columns": [],
+  "suspected_identifier_columns": [
+    "customer_id",
+    "income"
+  ],
+  "high_cardinality_columns": [],
+  "numeric_outlier_report": {
+    "customer_id": {
+      "status": "completed",
+      "lower_bound": 999.0,
+      "upper_bound": 1007.0,
+      "outlier_count": 0,
+      "outlier_ratio": 0.0
+    },
+    "age": {
+      "status": "skipped_too_few_values",
+      "outlier_count": 0,
+      "outlier_ratio": 0.0
+    },
+    "income": {
+      "status": "completed",
+      "lower_bound": 1700.0,
+      "upper_bound": 10500.0,
+      "outlier_count": 0,
+      "outlier_ratio": 0.0
+    },
+    "target": {
+      "status": "completed",
+      "lower_bound": -1.5,
+      "upper_bound": 2.5,
+      "outlier_count": 0,
+      "outlier_ratio": 0.0
+    }
+  },
+  "recommended_actions": {
+    "drop_or_review_constant_columns": [],
+    "drop_or_review_all_missing_columns": [],
+    "review_high_missing_columns": [],
+    "review_identifier_columns_for_leakage": [
+      "customer_id",
+      "income"
+    ],
+    "review_high_cardinality_columns_for_encoding": [],
+    "review_possible_target_leakage_columns": []
+  }
+}
