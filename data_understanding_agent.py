@@ -12,12 +12,16 @@ import pandas as pd
 
 @dataclass
 class AgentConfig:
-    data_path: str
     output_dir: str
     target_column: Optional[str] = None
     problem_type: Optional[str] = None
     dataset_name: Optional[str] = None
     random_state: int = 42
+
+    # Optional LLM enhancement
+    use_llm_insights: bool = False
+    llm_model: str = "gpt-5-mini"
+    llm_temperature: float = 0.0
 
 
 class DataUnderstandingAgent:
@@ -25,60 +29,97 @@ class DataUnderstandingAgent:
     AUTODS Data Understanding Agent
 
     Responsibilities:
-    - Read raw tabular data
-    - Profile schema and feature types
-    - Diagnose quality issues
+    - Profile raw tabular data already loaded in memory
+    - Infer schema and feature types
+    - Diagnose data quality issues
     - Analyse target column when available
     - Export structured JSON artifacts for downstream agents
+    - Optionally expose an LLM insights interface
     """
+
+    AGENT_NAME = "AUTODS_DATA_UNDERSTANDING"
 
     def __init__(self, config: AgentConfig) -> None:
         self.config = config
-        self.data_path = Path(config.data_path)
         self.output_dir = Path(config.output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
-    def run(self) -> Dict[str, Any]:
-        df = self._load_data()
+    def run(self, df: pd.DataFrame) -> Dict[str, Any]:
+        try:
+            if not isinstance(df, pd.DataFrame):
+                raise TypeError("run() expects a pandas DataFrame.")
 
-        data_profile = self._build_data_profile(df)
-        data_quality_report = self._build_data_quality_report(df)
-        target_analysis = self._build_target_analysis(df)
-        data_understanding_summary = self._build_summary(
-            df=df,
-            data_profile=data_profile,
-            data_quality_report=data_quality_report,
-            target_analysis=target_analysis,
-        )
-        metadata = self._build_metadata(df)
+            data_profile = self._build_data_profile(df)
+            data_quality_report = self._build_data_quality_report(df)
+            target_analysis = self._build_target_analysis(df)
+            data_understanding_summary = self._build_summary(
+                df=df,
+                data_profile=data_profile,
+                data_quality_report=data_quality_report,
+                target_analysis=target_analysis,
+            )
 
-        self._write_json("data_profile.json", data_profile)
-        self._write_json("data_quality_report.json", data_quality_report)
-        self._write_json("target_analysis.json", target_analysis)
-        self._write_json("data_understanding_summary.json", data_understanding_summary)
-        self._write_json("data_understanding_metadata.json", metadata)
-
-        return {
-            "status": "success",
-            "output_dir": str(self.output_dir.resolve()),
-            "generated_files": [
+            llm_insights = None
+            generated_files = [
                 "data_profile.json",
                 "data_quality_report.json",
                 "target_analysis.json",
                 "data_understanding_summary.json",
                 "data_understanding_metadata.json",
-            ],
-        }
+            ]
 
-    def _load_data(self) -> pd.DataFrame:
-        if not self.data_path.exists():
-            raise FileNotFoundError(f"Data file not found: {self.data_path}")
+            if self.config.use_llm_insights:
+                llm_insights = self._generate_llm_insights(
+                    data_profile=data_profile,
+                    data_quality_report=data_quality_report,
+                    target_analysis=target_analysis,
+                )
+                self._write_json("llm_insights.json", llm_insights)
+                generated_files.append("llm_insights.json")
 
-        suffix = self.data_path.suffix.lower()
+            metadata = self._build_metadata(df, generated_files)
+
+            self._write_json("data_profile.json", data_profile)
+            self._write_json("data_quality_report.json", data_quality_report)
+            self._write_json("target_analysis.json", target_analysis)
+            self._write_json(
+                "data_understanding_summary.json", data_understanding_summary
+            )
+            self._write_json("data_understanding_metadata.json", metadata)
+
+            return {
+                "status": "success",
+                "agent_name": self.AGENT_NAME,
+                "output_dir": str(self.output_dir.resolve()),
+                "generated_files": generated_files,
+                "result": {
+                    "data_profile": data_profile,
+                    "data_quality_report": data_quality_report,
+                    "target_analysis": target_analysis,
+                    "data_understanding_summary": data_understanding_summary,
+                    "metadata": metadata,
+                    "llm_insights": llm_insights,
+                },
+            }
+
+        except Exception as e:
+            return {
+                "status": "failure",
+                "agent_name": self.AGENT_NAME,
+                "error_message": str(e),
+            }
+
+    @staticmethod
+    def load_dataframe(data_path: str) -> pd.DataFrame:
+        path = Path(data_path)
+        if not path.exists():
+            raise FileNotFoundError(f"Data file not found: {path}")
+
+        suffix = path.suffix.lower()
         if suffix == ".csv":
-            return pd.read_csv(self.data_path)
+            return pd.read_csv(path)
         if suffix in {".parquet", ".pq"}:
-            return pd.read_parquet(self.data_path)
+            return pd.read_parquet(path)
 
         raise ValueError("Unsupported file type. Only CSV and Parquet are supported.")
 
@@ -107,8 +148,7 @@ class DataUnderstandingAgent:
             }
 
         return {
-            "dataset_name": self.config.dataset_name or self.data_path.stem,
-            "data_path": str(self.data_path),
+            "dataset_name": self._resolve_dataset_name(),
             "shape": {
                 "rows": self._safe_int(df.shape[0]),
                 "columns": self._safe_int(df.shape[1]),
@@ -123,7 +163,7 @@ class DataUnderstandingAgent:
 
     def _build_data_quality_report(self, df: pd.DataFrame) -> Dict[str, Any]:
         missing_counts = df.isnull().sum()
-        missing_ratios = (df.isnull().mean()).round(6)
+        missing_ratios = df.isnull().mean().round(6)
 
         duplicate_rows = self._safe_int(df.duplicated().sum())
         constant_columns = [
@@ -194,6 +234,7 @@ class DataUnderstandingAgent:
             return {
                 "target_column": None,
                 "problem_type": self.config.problem_type,
+                "inferred_problem_type": None,
                 "status": "no_target_provided",
                 "message": "Target analysis skipped because no target column was provided.",
             }
@@ -202,23 +243,26 @@ class DataUnderstandingAgent:
             return {
                 "target_column": target_column,
                 "problem_type": self.config.problem_type,
+                "inferred_problem_type": None,
                 "status": "target_not_found",
                 "message": f"Target column '{target_column}' was not found in dataset.",
             }
 
         y = df[target_column]
         inferred_problem_type = self._infer_problem_type(y)
+        resolved_problem_type = self.config.problem_type or inferred_problem_type
 
         result = {
             "target_column": target_column,
-            "problem_type": self.config.problem_type or inferred_problem_type,
+            "problem_type": resolved_problem_type,
             "inferred_problem_type": inferred_problem_type,
             "missing_count": self._safe_int(y.isnull().sum()),
             "missing_ratio": self._safe_float(y.isnull().mean()),
             "n_unique": self._safe_int(y.nunique(dropna=True)),
+            "status": "success",
         }
 
-        if (self.config.problem_type or inferred_problem_type) == "classification":
+        if resolved_problem_type == "classification":
             vc = y.astype("object").fillna("__MISSING__").value_counts(dropna=False)
             class_dist = {str(k): self._safe_int(v) for k, v in vc.to_dict().items()}
             valid_counts = [v for v in class_dist.values() if v > 0]
@@ -340,7 +384,7 @@ class DataUnderstandingAgent:
 
         return {
             "status": "success",
-            "dataset_name": self.config.dataset_name or self.data_path.stem,
+            "dataset_name": self._resolve_dataset_name(),
             "executive_summary": self._generate_executive_summary(
                 data_profile=data_profile,
                 data_quality_report=data_quality_report,
@@ -356,12 +400,13 @@ class DataUnderstandingAgent:
             "downstream_handoff": downstream_handoff,
         }
 
-    def _build_metadata(self, df: pd.DataFrame) -> Dict[str, Any]:
+    def _build_metadata(
+        self, df: pd.DataFrame, generated_files: List[str]
+    ) -> Dict[str, Any]:
         return {
-            "agent_name": "AUTODS_DATA_UNDERSTANDING",
+            "agent_name": self.AGENT_NAME,
             "run_timestamp_utc": datetime.now(timezone.utc).isoformat(),
-            "data_path": str(self.data_path.resolve()),
-            "dataset_name": self.config.dataset_name or self.data_path.stem,
+            "dataset_name": self._resolve_dataset_name(),
             "output_dir": str(self.output_dir.resolve()),
             "target_column": self.config.target_column,
             "problem_type_config": self.config.problem_type,
@@ -370,13 +415,11 @@ class DataUnderstandingAgent:
                 "rows": self._safe_int(df.shape[0]),
                 "columns": self._safe_int(df.shape[1]),
             },
-            "generated_files": [
-                "data_profile.json",
-                "data_quality_report.json",
-                "target_analysis.json",
-                "data_understanding_summary.json",
-                "data_understanding_metadata.json",
-            ],
+            "generated_files": generated_files,
+            "use_llm_insights": self.config.use_llm_insights,
+            "llm_model": (
+                self.config.llm_model if self.config.use_llm_insights else None
+            ),
         }
 
     def _infer_feature_types(self, df: pd.DataFrame) -> Dict[str, List[str]]:
@@ -408,7 +451,7 @@ class DataUnderstandingAgent:
             unique_ratio = df[col].nunique(dropna=True) / max(n_rows, 1)
 
             if (
-                "id" == name_lower
+                name_lower == "id"
                 or name_lower.endswith("_id")
                 or "uuid" in name_lower
                 or "identifier" in name_lower
@@ -421,11 +464,13 @@ class DataUnderstandingAgent:
     def _detect_high_cardinality_columns(self, df: pd.DataFrame) -> List[str]:
         high_card_cols = []
         feature_types = self._infer_feature_types(df)
+
         for col in feature_types["categorical_columns"]:
             nunique = df[col].nunique(dropna=True)
             ratio = nunique / max(len(df), 1)
             if nunique >= 20 or ratio >= 0.30:
                 high_card_cols.append(col)
+
         return high_card_cols
 
     def _detect_numeric_outliers(self, df: pd.DataFrame) -> Dict[str, Any]:
@@ -434,6 +479,7 @@ class DataUnderstandingAgent:
 
         for col in feature_types["numeric_columns"]:
             s = pd.to_numeric(df[col], errors="coerce").dropna()
+
             if len(s) < 5:
                 report[col] = {
                     "status": "skipped_too_few_values",
@@ -469,9 +515,7 @@ class DataUnderstandingAgent:
         return report
 
     def _infer_problem_type(self, y: pd.Series) -> str:
-        if self.config.problem_type in {"classification", "regression"}:
-            return self.config.problem_type
-
+        """Pure inference only. Does not read config."""
         if pd.api.types.is_numeric_dtype(y) and y.nunique(dropna=True) > 20:
             return "regression"
         return "classification"
@@ -499,7 +543,7 @@ class DataUnderstandingAgent:
             )
 
         if data_quality_report["suspected_identifier_columns"]:
-            summary += f"Identifier-like columns were detected and should be assessed for leakage risk. "
+            summary += "Identifier-like columns were detected and should be assessed for leakage risk. "
 
         if target_analysis.get("status") == "no_target_provided":
             summary += "No target column was provided, so target-specific analysis was skipped."
@@ -512,6 +556,16 @@ class DataUnderstandingAgent:
             )
 
         return summary
+
+    def _generate_llm_insights(
+        self,
+        data_profile: Dict[str, Any],
+        data_quality_report: Dict[str, Any],
+        target_analysis: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        raise NotImplementedError(
+            "LLM insights were enabled, but no real LLM client has been implemented yet."
+        )
 
     def _build_primary_risks(
         self,
@@ -571,16 +625,23 @@ class DataUnderstandingAgent:
         output_path = self.output_dir / filename
         with output_path.open("w", encoding="utf-8") as f:
             json.dump(
-                payload, f, indent=2, ensure_ascii=False, default=self._json_default
+                payload,
+                f,
+                indent=2,
+                ensure_ascii=False,
+                default=self._json_default,
             )
+
+    def _resolve_dataset_name(self) -> str:
+        return self.config.dataset_name or "in_memory_dataset"
 
     @staticmethod
     def _json_default(obj: Any) -> Any:
-        if isinstance(obj, (np.integer,)):
+        if isinstance(obj, np.integer):
             return int(obj)
-        if isinstance(obj, (np.floating,)):
+        if isinstance(obj, np.floating):
             return float(obj)
-        if isinstance(obj, (np.bool_,)):
+        if isinstance(obj, np.bool_):
             return bool(obj)
         if isinstance(obj, (pd.Timestamp, datetime)):
             return obj.isoformat()
