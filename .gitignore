@@ -2,4 +2,5 @@
 venv/
 __pycache__/
 *.pyc
-understanding_output/
+data_understanding_outputs/
+.DS_Store
