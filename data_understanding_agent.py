@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace as dataclass_replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -24,6 +24,76 @@ class AgentConfig:
     llm_temperature: float = 0.0
 
 
+@dataclass
+class PlannerInput:
+    """Lightweight planner contract for the Data Understanding Agent.
+
+    This allows an upstream planner/orchestrator to override selected config
+    fields and optionally control which columns are used or dropped before
+    profiling/analysis.
+    """
+
+    source: str = "unknown"
+    schema_version: str = "1.0"
+    rationale: str = ""
+
+    target_column: Optional[str] = None
+    problem_type: Optional[str] = None
+    dataset_name: Optional[str] = None
+
+    drop_columns: Optional[List[str]] = None
+    use_columns: Optional[List[str]] = None
+
+    extra: Dict[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "PlannerInput":
+        known_keys = {
+            "source",
+            "schema_version",
+            "rationale",
+            "target_column",
+            "problem_type",
+            "dataset_name",
+            "drop_columns",
+            "use_columns",
+        }
+        return cls(
+            source=data.get("source", "unknown"),
+            schema_version=data.get("schema_version", "1.0"),
+            rationale=data.get("rationale", ""),
+            target_column=data.get("target_column"),
+            problem_type=data.get("problem_type"),
+            dataset_name=data.get("dataset_name"),
+            drop_columns=data.get("drop_columns"),
+            use_columns=data.get("use_columns"),
+            extra={k: v for k, v in data.items() if k not in known_keys},
+        )
+
+    @classmethod
+    def from_json_file(cls, path: str) -> "PlannerInput":
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return cls.from_dict(data)
+
+    def apply_to_config(self, config: AgentConfig) -> AgentConfig:
+        overrides: Dict[str, Any] = {}
+        if self.target_column is not None:
+            overrides["target_column"] = self.target_column
+        if self.problem_type is not None:
+            overrides["problem_type"] = self.problem_type
+        if self.dataset_name is not None:
+            overrides["dataset_name"] = self.dataset_name
+        return dataclass_replace(config, **overrides) if overrides else config
+
+
+def load_planner_input(path: str) -> PlannerInput:
+    planner_path = Path(path)
+    if not planner_path.exists():
+        raise FileNotFoundError(f"Planner input file not found: {path}")
+    return PlannerInput.from_json_file(path)
+
+
 class DataUnderstandingAgent:
     """
     AUTODS Data Understanding Agent
@@ -39,7 +109,16 @@ class DataUnderstandingAgent:
 
     AGENT_NAME = "AUTODS_DATA_UNDERSTANDING"
 
-    def __init__(self, config: AgentConfig) -> None:
+    def __init__(
+        self,
+        config: AgentConfig,
+        planner_input: Optional[PlannerInput] = None,
+    ) -> None:
+        self.planner_input_: Optional[PlannerInput] = planner_input
+
+        if planner_input is not None:
+            config = planner_input.apply_to_config(config)
+
         self.config = config
         self.output_dir = Path(config.output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -48,6 +127,8 @@ class DataUnderstandingAgent:
         try:
             if not isinstance(df, pd.DataFrame):
                 raise TypeError("run() expects a pandas DataFrame.")
+
+            df = self._apply_planner_feature_hints(df)
 
             data_profile = self._build_data_profile(df)
             data_quality_report = self._build_data_quality_report(df)
@@ -77,14 +158,16 @@ class DataUnderstandingAgent:
                 self._write_json("llm_insights.json", llm_insights)
                 generated_files.append("llm_insights.json")
 
+            if self.planner_input_ is not None:
+                self._write_json("planner_input.json", self._planner_input_as_dict())
+                generated_files.append("planner_input.json")
+
             metadata = self._build_metadata(df, generated_files)
 
             self._write_json("data_profile.json", data_profile)
             self._write_json("data_quality_report.json", data_quality_report)
             self._write_json("target_analysis.json", target_analysis)
-            self._write_json(
-                "data_understanding_summary.json", data_understanding_summary
-            )
+            self._write_json("data_understanding_summary.json", data_understanding_summary)
             self._write_json("data_understanding_metadata.json", metadata)
 
             return {
@@ -122,6 +205,44 @@ class DataUnderstandingAgent:
             return pd.read_parquet(path)
 
         raise ValueError("Unsupported file type. Only CSV and Parquet are supported.")
+
+    def _apply_planner_feature_hints(self, df: pd.DataFrame) -> pd.DataFrame:
+        if self.planner_input_ is None:
+            return df
+
+        df = df.copy()
+
+        if self.planner_input_.use_columns:
+            keep_cols = [c for c in self.planner_input_.use_columns if c in df.columns]
+            if self.config.target_column and self.config.target_column in df.columns:
+                if self.config.target_column not in keep_cols:
+                    keep_cols.append(self.config.target_column)
+            if keep_cols:
+                df = df[keep_cols].copy()
+
+        elif self.planner_input_.drop_columns:
+            drop_cols = [c for c in self.planner_input_.drop_columns if c in df.columns]
+            if self.config.target_column and self.config.target_column in drop_cols:
+                drop_cols.remove(self.config.target_column)
+            if drop_cols:
+                df = df.drop(columns=drop_cols).copy()
+
+        return df
+
+    def _planner_input_as_dict(self) -> Dict[str, Any]:
+        if self.planner_input_ is None:
+            return {}
+        return {
+            "source": self.planner_input_.source,
+            "schema_version": self.planner_input_.schema_version,
+            "rationale": self.planner_input_.rationale,
+            "target_column": self.planner_input_.target_column,
+            "problem_type": self.planner_input_.problem_type,
+            "dataset_name": self.planner_input_.dataset_name,
+            "drop_columns": self.planner_input_.drop_columns,
+            "use_columns": self.planner_input_.use_columns,
+            "extra": self.planner_input_.extra,
+        }
 
     def _build_data_profile(self, df: pd.DataFrame) -> Dict[str, Any]:
         feature_types = self._infer_feature_types(df)
@@ -204,19 +325,15 @@ class DataUnderstandingAgent:
         return {
             "missing_values": {
                 "missing_count_by_column": {
-                    col: self._safe_int(v)
-                    for col, v in missing_counts.to_dict().items()
+                    col: self._safe_int(v) for col, v in missing_counts.to_dict().items()
                 },
                 "missing_ratio_by_column": {
-                    col: self._safe_float(v)
-                    for col, v in missing_ratios.to_dict().items()
+                    col: self._safe_float(v) for col, v in missing_ratios.to_dict().items()
                 },
             },
             "duplicate_rows": {
                 "count": duplicate_rows,
-                "ratio": (
-                    self._safe_float(duplicate_rows / len(df)) if len(df) > 0 else 0.0
-                ),
+                "ratio": self._safe_float(duplicate_rows / len(df)) if len(df) > 0 else 0.0,
             },
             "constant_columns": constant_columns,
             "all_missing_columns": all_missing_columns,
@@ -334,10 +451,7 @@ class DataUnderstandingAgent:
                 f"{len(identifier_columns)} identifier-like columns were detected and should be reviewed for leakage."
             )
 
-        if target_analysis.get("status") not in {
-            "no_target_provided",
-            "target_not_found",
-        }:
+        if target_analysis.get("status") not in {"no_target_provided", "target_not_found"}:
             if target_analysis.get("problem_type") == "classification":
                 ratio = target_analysis.get("imbalance_ratio_max_over_min", 1.0)
                 major_findings.append(
@@ -357,16 +471,10 @@ class DataUnderstandingAgent:
                 ),
             },
             "feature_engineering_agent": {
-                "categorical_columns": data_profile["feature_types"][
-                    "categorical_columns"
-                ],
+                "categorical_columns": data_profile["feature_types"]["categorical_columns"],
                 "numeric_columns": data_profile["feature_types"]["numeric_columns"],
-                "high_cardinality_columns": data_quality_report[
-                    "high_cardinality_columns"
-                ],
-                "suspected_identifier_columns": data_quality_report[
-                    "suspected_identifier_columns"
-                ],
+                "high_cardinality_columns": data_quality_report["high_cardinality_columns"],
+                "suspected_identifier_columns": data_quality_report["suspected_identifier_columns"],
             },
             "modelling_agent": {
                 "target_column": self.config.target_column,
@@ -376,9 +484,7 @@ class DataUnderstandingAgent:
                     if target_analysis.get("problem_type") == "classification"
                     else False
                 ),
-                "recommended_metrics": target_analysis.get(
-                    "recommended_primary_metrics", []
-                ),
+                "recommended_metrics": target_analysis.get("recommended_primary_metrics", []),
             },
         }
 
@@ -417,9 +523,9 @@ class DataUnderstandingAgent:
             },
             "generated_files": generated_files,
             "use_llm_insights": self.config.use_llm_insights,
-            "llm_model": (
-                self.config.llm_model if self.config.use_llm_insights else None
-            ),
+            "llm_model": self.config.llm_model if self.config.use_llm_insights else None,
+            "planner_input_source": self.planner_input_.source if self.planner_input_ is not None else None,
+            "planner_input_available": self.planner_input_ is not None,
         }
 
     def _infer_feature_types(self, df: pd.DataFrame) -> Dict[str, List[str]]:
@@ -543,7 +649,9 @@ class DataUnderstandingAgent:
             )
 
         if data_quality_report["suspected_identifier_columns"]:
-            summary += "Identifier-like columns were detected and should be assessed for leakage risk. "
+            summary += (
+                "Identifier-like columns were detected and should be assessed for leakage risk. "
+            )
 
         if target_analysis.get("status") == "no_target_provided":
             summary += "No target column was provided, so target-specific analysis was skipped."

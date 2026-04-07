@@ -4,7 +4,11 @@ from pathlib import Path
 
 import pandas as pd
 
-from data_understanding_agent import AgentConfig, DataUnderstandingAgent
+from data_understanding_agent import (
+    AgentConfig,
+    DataUnderstandingAgent,
+    load_planner_input,
+)
 
 
 def parse_args():
@@ -21,6 +25,7 @@ def parse_args():
     parser.add_argument("--output-dir", type=str, default="data_understanding_outputs")
     parser.add_argument("--dataset-name", type=str, default=None)
     parser.add_argument("--random-state", type=int, default=42)
+    parser.add_argument("--planner-input", type=str, default=None)
 
     return parser.parse_args()
 
@@ -48,7 +53,11 @@ def main():
         random_state=args.random_state,
     )
 
-    agent = DataUnderstandingAgent(config)
+    planner_input = None
+    if args.planner_input:
+        planner_input = load_planner_input(args.planner_input)
+
+    agent = DataUnderstandingAgent(config, planner_input=planner_input)
     result = agent.run(df)
 
     print(json.dumps(result, indent=2, ensure_ascii=False))
