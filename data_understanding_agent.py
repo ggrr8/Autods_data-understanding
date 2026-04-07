@@ -4,7 +4,7 @@ import json
 from dataclasses import dataclass, field, replace as dataclass_replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 import numpy as np
 import pandas as pd
@@ -23,15 +23,15 @@ class AgentConfig:
     llm_model: str = "gpt-4o-mini"
     llm_temperature: float = 0.0
 
+    # Optional business context supplied by an upstream planner
+    # Keys: normalised_description, primary_metric, reasoning,
+    #       constraints (dict), focus_columns (list)
+    business_context: Optional[Dict] = None
+
 
 @dataclass
 class PlannerInput:
-    """Lightweight planner contract for the Data Understanding Agent.
-
-    This allows an upstream planner/orchestrator to override selected config
-    fields and optionally control which columns are used or dropped before
-    profiling/analysis.
-    """
+    """Lightweight planner contract for the Data Understanding Agent."""
 
     source: str = "unknown"
     schema_version: str = "1.0"
@@ -49,14 +49,8 @@ class PlannerInput:
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "PlannerInput":
         known_keys = {
-            "source",
-            "schema_version",
-            "rationale",
-            "target_column",
-            "problem_type",
-            "dataset_name",
-            "drop_columns",
-            "use_columns",
+            "source", "schema_version", "rationale", "target_column",
+            "problem_type", "dataset_name", "drop_columns", "use_columns",
         }
         return cls(
             source=data.get("source", "unknown"),
@@ -133,11 +127,18 @@ class DataUnderstandingAgent:
             data_profile = self._build_data_profile(df)
             data_quality_report = self._build_data_quality_report(df)
             target_analysis = self._build_target_analysis(df)
+
+            # Business alignment — only produced when business_context is set
+            business_alignment: Optional[Dict[str, Any]] = None
+            if self.config.business_context:
+                business_alignment = self._build_business_alignment(df, target_analysis)
+
             data_understanding_summary = self._build_summary(
                 df=df,
                 data_profile=data_profile,
                 data_quality_report=data_quality_report,
                 target_analysis=target_analysis,
+                business_alignment=business_alignment,
             )
 
             llm_insights = None
@@ -180,6 +181,7 @@ class DataUnderstandingAgent:
                     "data_quality_report": data_quality_report,
                     "target_analysis": target_analysis,
                     "data_understanding_summary": data_understanding_summary,
+                    "business_alignment": business_alignment,
                     "metadata": metadata,
                     "llm_insights": llm_insights,
                 },
@@ -268,7 +270,7 @@ class DataUnderstandingAgent:
                 str(k): self._safe_int(v) for k, v in vc.to_dict().items()
             }
 
-        return {
+        profile: Dict[str, Any] = {
             "dataset_name": self._resolve_dataset_name(),
             "shape": {
                 "rows": self._safe_int(df.shape[0]),
@@ -281,6 +283,47 @@ class DataUnderstandingAgent:
             "categorical_value_preview": categorical_preview,
             "memory_usage_bytes": self._safe_int(df.memory_usage(deep=True).sum()),
         }
+
+        # Business-context-aware: detailed stats for focus_columns
+        if self.config.business_context:
+            focus_columns: List[str] = self.config.business_context.get("focus_columns", [])
+            if focus_columns:
+                focus_analysis: Dict[str, Any] = {}
+                target_col = self.config.target_column
+                for col in focus_columns:
+                    if col not in df.columns:
+                        continue
+                    col_info: Dict[str, Any] = {"is_business_key_column": True}
+                    if col in feature_types["numeric_columns"]:
+                        s = pd.to_numeric(df[col], errors="coerce")
+                        col_info["distribution"] = {
+                            "p10": self._safe_float(s.quantile(0.10)),
+                            "p25": self._safe_float(s.quantile(0.25)),
+                            "p50": self._safe_float(s.quantile(0.50)),
+                            "p75": self._safe_float(s.quantile(0.75)),
+                            "p90": self._safe_float(s.quantile(0.90)),
+                            "p99": self._safe_float(s.quantile(0.99)),
+                        }
+                        q1 = s.quantile(0.25)
+                        q3 = s.quantile(0.75)
+                        iqr = q3 - q1
+                        if iqr > 0:
+                            n_valid = len(s.dropna())
+                            if n_valid > 0:
+                                outliers = ((s < q1 - 1.5 * iqr) | (s > q3 + 1.5 * iqr)).sum()
+                                col_info["outlier_ratio"] = self._safe_float(outliers / n_valid)
+                        if target_col and target_col in df.columns:
+                            try:
+                                y_num = pd.to_numeric(df[target_col], errors="coerce")
+                                col_info["correlation_with_target"] = self._safe_float(
+                                    s.corr(y_num)
+                                )
+                            except Exception:
+                                pass
+                    focus_analysis[col] = col_info
+                profile["focus_columns_analysis"] = focus_analysis
+
+        return profile
 
     def _build_data_quality_report(self, df: pd.DataFrame) -> Dict[str, Any]:
         missing_counts = df.isnull().sum()
@@ -369,7 +412,7 @@ class DataUnderstandingAgent:
         inferred_problem_type = self._infer_problem_type(y)
         resolved_problem_type = self.config.problem_type or inferred_problem_type
 
-        result = {
+        result: Dict[str, Any] = {
             "target_column": target_column,
             "problem_type": resolved_problem_type,
             "inferred_problem_type": inferred_problem_type,
@@ -400,6 +443,14 @@ class DataUnderstandingAgent:
                     ],
                 }
             )
+            # Business-context-aware: warn when roc_auc is chosen with severe imbalance
+            if self.config.business_context:
+                primary_metric = self.config.business_context.get("primary_metric", "")
+                if primary_metric == "roc_auc" and imbalance_ratio > 10.0:
+                    result["primary_metric_note"] = (
+                        f"当前数据分布下 roc_auc 可能虚高（类别不平衡比例 {imbalance_ratio:.1f}:1），"
+                        "建议关注 f1"
+                    )
         else:
             y_num = pd.to_numeric(y, errors="coerce")
             result.update(
@@ -426,6 +477,7 @@ class DataUnderstandingAgent:
         data_profile: Dict[str, Any],
         data_quality_report: Dict[str, Any],
         target_analysis: Dict[str, Any],
+        business_alignment: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         major_findings = []
 
@@ -488,7 +540,7 @@ class DataUnderstandingAgent:
             },
         }
 
-        return {
+        summary: Dict[str, Any] = {
             "status": "success",
             "dataset_name": self._resolve_dataset_name(),
             "executive_summary": self._generate_executive_summary(
@@ -505,6 +557,12 @@ class DataUnderstandingAgent:
             ),
             "downstream_handoff": downstream_handoff,
         }
+
+        # Only add when business_context was provided — keeps existing readers unbroken
+        if business_alignment is not None:
+            summary["business_alignment"] = business_alignment
+
+        return summary
 
     def _build_metadata(
         self, df: pd.DataFrame, generated_files: List[str]
@@ -526,6 +584,98 @@ class DataUnderstandingAgent:
             "llm_model": self.config.llm_model if self.config.use_llm_insights else None,
             "planner_input_source": self.planner_input_.source if self.planner_input_ is not None else None,
             "planner_input_available": self.planner_input_ is not None,
+            "business_context_provided": self.config.business_context is not None,
+        }
+
+    def _build_business_alignment(
+        self, df: pd.DataFrame, target_analysis: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Produce the business_alignment block (section 1.3 of the spec).
+
+        Only called when config.business_context is not None.
+        """
+        bc = self.config.business_context or {}
+        target_column = self.config.target_column
+
+        # target column existence (case-insensitive fallback)
+        target_column_found = False
+        target_column_actual = target_column
+        if target_column:
+            if target_column in df.columns:
+                target_column_found = True
+            else:
+                for col in df.columns:
+                    if col.lower() == target_column.lower():
+                        target_column_found = True
+                        target_column_actual = col
+                        break
+
+        # imbalance metrics
+        imbalance_ratio = float(target_analysis.get("imbalance_ratio_max_over_min") or 1.0)
+        class_dist = target_analysis.get("class_distribution", {})
+        total_samples = sum(class_dist.values()) if class_dist else df.shape[0]
+        majority_count = max(class_dist.values()) if class_dist else 0
+        imbalance_ratio_majority = (
+            self._safe_float(majority_count / total_samples) if total_samples > 0 else None
+        )
+
+        if imbalance_ratio >= 10.0:
+            imbalance_severity = "severe"
+        elif imbalance_ratio >= 3.0:
+            imbalance_severity = "moderate"
+        else:
+            imbalance_severity = "none"
+
+        # primary metric suitability
+        primary_metric = bc.get("primary_metric", "")
+        primary_metric_suitable = True
+        metric_suitability_reason = ""
+        if (
+            primary_metric == "roc_auc"
+            and target_analysis.get("problem_type") == "classification"
+            and imbalance_ratio > 10.0
+        ):
+            primary_metric_suitable = False
+            metric_suitability_reason = (
+                f"严重类别不平衡（比例 {imbalance_ratio:.1f}:1），"
+                "roc_auc 可能虚高，建议关注 f1"
+            )
+
+        # data volume assessment
+        n_rows = df.shape[0]
+        if n_rows >= 1000:
+            data_volume_assessment = "sufficient"
+            data_volume_reason = f"样本量 {n_rows} 足以支撑稳健建模"
+        elif n_rows >= 200:
+            data_volume_assessment = "marginal"
+            data_volume_reason = f"样本量 {n_rows} 偏少，建模结果可能不稳定，建议增加数据"
+        else:
+            data_volume_assessment = "insufficient"
+            data_volume_reason = f"样本量 {n_rows} 严重不足，建议优先扩充数据集后再建模"
+
+        # business concerns
+        business_concerns: List[str] = []
+        if imbalance_severity == "severe":
+            business_concerns.append(
+                "目标列存在严重类别不平衡，需考虑过采样/欠采样策略或调整评估指标"
+            )
+        if data_volume_assessment == "marginal":
+            business_concerns.append("数据量偏少，模型泛化能力可能受限，建议交叉验证评估稳定性")
+        elif data_volume_assessment == "insufficient":
+            business_concerns.append("数据量严重不足，模型结果可信度低，建议优先扩充数据集")
+        if not primary_metric_suitable:
+            business_concerns.append(metric_suitability_reason)
+
+        return {
+            "target_column_found": target_column_found,
+            "target_column_actual": target_column_actual,
+            "primary_metric_suitable": primary_metric_suitable,
+            "metric_suitability_reason": metric_suitability_reason,
+            "data_volume_assessment": data_volume_assessment,
+            "data_volume_reason": data_volume_reason,
+            "imbalance_severity": imbalance_severity,
+            "imbalance_ratio": imbalance_ratio_majority,
+            "business_concerns": business_concerns,
         }
 
     def _infer_feature_types(self, df: pd.DataFrame) -> Dict[str, List[str]]:
@@ -670,9 +820,73 @@ class DataUnderstandingAgent:
         data_profile: Dict[str, Any],
         data_quality_report: Dict[str, Any],
         target_analysis: Dict[str, Any],
+        llm_fn: Optional[Callable[[str], str]] = None,
     ) -> Dict[str, Any]:
+        """Build a structured LLM insights payload.
+
+        When business_context is set the prompt includes a business context
+        section (normalised_description, primary_metric, constraints) and
+        requests a Business Relevance Assessment block from the LLM.
+
+        Args:
+            llm_fn: Optional callable (prompt: str) -> str.  If provided it
+                    is invoked with the assembled prompt and its response is
+                    stored under the llm_response key.  When None the prompt
+                    is assembled but no call is made.
+
+        Raises:
+            NotImplementedError: when use_llm_insights=True but no llm_fn was
+                                 supplied and no default client has been wired in.
+        """
+        prompt_parts: List[str] = [
+            "You are a senior data scientist. Analyse the following dataset "
+            "statistics and provide concise insights.\n",
+            "## Dataset Overview",
+            (
+                f"Shape: {data_profile['shape']['rows']} rows x "
+                f"{data_profile['shape']['columns']} columns"
+            ),
+            "",
+            "## Data Quality Summary",
+            f"High-missing columns (>=30%): {data_quality_report['high_missing_columns']}",
+            f"Duplicate rows: {data_quality_report['duplicate_rows']['count']}",
+            f"Suspected identifier columns: {data_quality_report['suspected_identifier_columns']}",
+            "",
+            "## Target Analysis",
+            f"Problem type: {target_analysis.get('problem_type', 'unknown')}",
+        ]
+
+        if target_analysis.get("problem_type") == "classification":
+            prompt_parts.append(
+                f"Class imbalance ratio (max/min): "
+                f"{target_analysis.get('imbalance_ratio_max_over_min', 'N/A')}"
+            )
+
+        # Inject business context when available
+        if self.config.business_context:
+            bc = self.config.business_context
+            prompt_parts += [
+                "",
+                "## Business Context",
+                f"Task description: {bc.get('normalised_description', 'N/A')}",
+                f"Primary evaluation metric: {bc.get('primary_metric', 'N/A')}",
+                f"Constraints: {bc.get('constraints', {})}",
+                "",
+                "Please include a **Business Relevance Assessment** section that "
+                "evaluates whether the data quality and features support the stated "
+                "business goal, and highlights any findings that require "
+                "business-side attention.",
+            ]
+
+        prompt = "\n".join(prompt_parts)
+
+        if llm_fn is not None:
+            llm_response = llm_fn(prompt)
+            return {"prompt": prompt, "llm_response": llm_response}
+
         raise NotImplementedError(
-            "LLM insights were enabled, but no real LLM client has been implemented yet."
+            "LLM insights were enabled, but no real LLM client has been implemented yet. "
+            "Pass a callable llm_fn or wire in a client before calling run()."
         )
 
     def _build_primary_risks(
